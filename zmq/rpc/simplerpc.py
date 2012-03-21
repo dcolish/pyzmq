@@ -28,23 +28,10 @@ To talk to this service::
 """
 
 #-----------------------------------------------------------------------------
+#  Copyright (C) 2012. Brian Granger, Min Ragan-Kelley  
 #
-#    Copyright (c) 2010 Min Ragan-Kelley, Brian Granger
-#
-#    This file is part of pyzmq.
-#
-#    pyzmq is free software; you can redistribute it and/or modify it under
-#    the terms of the Lesser GNU General Public License as published by
-#    the Free Software Foundation; either version 3 of the License, or
-#    (at your option) any later version.
-#
-#    pyzmq is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    Lesser GNU General Public License for more details.
-#
-#    You should have received a copy of the Lesser GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#  Distributed under the terms of the BSD License.  The full license is in
+#  the file COPYING.BSD, distributed as part of this software.
 #-----------------------------------------------------------------------------
 
 #-----------------------------------------------------------------------------
@@ -167,24 +154,42 @@ class RPCService(RPCBase):
         self.stream = ZMQStream(self.socket, self.loop)
         self.stream.on_recv(self._handle_request)
 
+    def _build_reply(self, status, data):
+        """Build a reply message for status and data.
+
+        Parameters
+        ----------
+        status : bytes
+            Either b'SUCCESS' or b'FAILURE'.
+        data : list of bytes
+            A list of data frame to be appended to the message.
+        """
+        reply = []
+        reply.extend(self.idents)
+        reply.extend([b'|', self.msg_id, status])
+        reply.extend(data)
+        return reply
+                    
     def _handle_request(self, msg_list):
         """Handle an incoming request.
 
         The request is received as a multipart message:
 
-        [ident, msg_id, method, <sequence of serialized args/kwargs>]
+        [<idents>, b'|', msg_id, method, <sequence of serialized args/kwargs>]
 
         The reply depends on if the call was successful or not:
 
-        [ident, msg_id, 'SUCCESS', <sequece of serialized result>]
-        [ident, msg_id, 'FAILURE', ename, evalue, traceback]
+        [<idents>, b'|', msg_id, 'SUCCESS', <sequece of serialized result>]
+        [<idents>, b'|', msg_id, 'FAILURE', <JSON dict of ename, evalue, traceback>]
 
         Here the (ename, evalue, traceback) are utf-8 encoded unicode.
         """
-        self.ident = msg_list[0]
-        self.msg_id = msg_list[1]
-        method = msg_list[2]
-        args, kwargs = self._serializer.deserialize_args_kwargs(msg_list[3:])
+        i = msg_list.index(b'|')
+        self.idents = msg_list[0:i]
+        self.msg_id = msg_list[i+1]
+        method = msg_list[i+2]
+        data = msg_list[i+3:]
+        args, kwargs = self._serializer.deserialize_args_kwargs(data)
 
         # Find and call the actual handler for message.
         handler = getattr(self, method, None)
@@ -195,27 +200,31 @@ class RPCService(RPCBase):
                 self._send_error()
             else:
                 try:
-                    presult = self._serializer.serialize_result(result)
-                except:
+                    data_list = self._serializer.serialize_result(result)
+                except Exception:
                     self._send_error()
                 else:
-                    msg_list = [self.ident, self.msg_id, b'SUCCESS']
-                    msg_list.extend(presult)
-                    self.stream.send_multipart(msg_list)
+                    reply = self._build_reply(b'SUCCESS', data_list)
+                    self.stream.send_multipart(reply)
         else:
             logging.error('Unknown RPC method: %s' % method)
+        self.idents = None
+        self.msg_id = None
 
     def _send_error(self):
         """Send an error reply."""
         etype, evalue, tb = sys.exc_info()
-        self.stream.send(self.ident, zmq.SNDMORE)
-        self.stream.send(self.msg_id, zmq.SNDMORE)
-        self.stream.send(b'FAILURE', zmq.SNDMORE)
-        self.stream.send_unicode(unicode(etype.__name__), zmq.SNDMORE)
-        self.stream.send_unicode(unicode(evalue), zmq.SNDMORE)
-        self.stream.send_unicode(unicode(traceback.format_exc(tb)))
+        error_dict = {
+            'ename' : str(etype.__name__),
+            'evalue' : str(evalue),
+            'traceback' : traceback.format_exc(tb)
+        }
+        data_list = [jsonapi.dumps(error_dict)]
+        reply = self._build_reply(b'FAILURE', data_list)
+        self.stream.send_multipart(reply)
 
-    def serve_forever(self):
+    def start(self):
+        """Start the event loop for this RPC service."""
         self.loop.start()
 
 
@@ -248,11 +257,12 @@ class RPCServiceProxyBase(RPCBase):
     def _init_stream(self):
         pass
 
-    def _build_msg(self, method, args, kwargs):
+    def _build_request(self, method, args, kwargs):
         msg_id = bytes(uuid.uuid4())
         method = bytes(method)
-        msg_list = [msg_id, method]
-        msg_list.extend(self._serializer.serialize_args_kwargs(args, kwargs))
+        msg_list = [b'|', msg_id, method]
+        data_list = self._serializer.serialize_args_kwargs(args, kwargs)
+        msg_list.extend(data_list)
         return msg_id, msg_list
 
 
@@ -271,8 +281,12 @@ class AsyncRPCServiceProxy(RPCServiceProxyBase):
         self.stream.on_recv(self._handle_reply)
 
     def _handle_reply(self, msg_list):
-        msg_id = msg_list[0]
-        status = msg_list[1]
+        # msg_list[0] == b'|'
+        if not msg_list[0] == b'|':
+            logging.error('Unexpected reply message format in AsyncRPCServiceProxy._handle_reply')
+            return
+        msg_id = msg_list[1]
+        status = msg_list[2]
         cb_eb_dc = self._callbacks.pop(msg_id, None) # (cb, eb) tuple
         if cb_eb_dc is not None:
             cb, eb, dc = cb_eb_dc
@@ -280,19 +294,17 @@ class AsyncRPCServiceProxy(RPCServiceProxyBase):
             if dc is not None:
                 dc.stop()
             if status == b'SUCCESS' and cb is not None:
-                result = self._serializer.deserialize_result(msg_list[2:])
+                result = self._serializer.deserialize_result(msg_list[3:])
                 try:
                     cb(result)
                 except:
                     logging.error('Unexpected callback error', exc_info=True)
             elif status == b'FAILURE' and eb is not None:
-                ename = msg_list[2].decode('utf-8')
-                evalue = msg_list[3].decode('utf-8')
-                tb = msg_list[4].decode('utf-8')
+                error_dict = jsonapi.loads(msg_list[3])
                 try:
-                    eb(ename, evalue, tb)
+                    eb(error_dict['ename'], error_dict['evalue'], error_dict['traceback'])
                 except:
-                    logging.error('Unexpected callback error', exc_info=True)
+                    logging.error('Unexpected errback error', exc_info=True)
 
     #-------------------------------------------------------------------------
     # Public API
@@ -333,7 +345,7 @@ class AsyncRPCServiceProxy(RPCServiceProxyBase):
         if not (errback is None or callable(errback)):
             raise TypeError("callable or None expected, got %r" % errback)
 
-        msg_id, msg_list = self._build_msg(method, args, kwargs)
+        msg_id, msg_list = self._build_request(method, args, kwargs)
         self.stream.send_multipart(msg_list)
 
         # The following logic assumes that the reply won't come back too
@@ -383,19 +395,19 @@ class RPCServiceProxy(RPCServiceProxyBase):
         if not self._ready:
             raise RuntimeError('bind or connect must be called first')
 
-        msg_id, msg_list = self._build_msg(method, args, kwargs)
+        msg_id, msg_list = self._build_request(method, args, kwargs)
         self.socket.send_multipart(msg_list)
         msg_list = self.socket.recv_multipart()
-        msg_id = msg_list[0]
-        status = msg_list[1]
+        if not msg_list[0] == b'|':
+            raise RPCError('Unexpected reply message format in AsyncRPCServiceProxy._handle_reply')
+        msg_id = msg_list[1]
+        status = msg_list[2]
         if status == b'SUCCESS':
-            result = self._serializer.deserialize_result(msg_list[2:])
+            result = self._serializer.deserialize_result(msg_list[3:])
             return result
         elif status == b'FAILURE':
-            ename = msg_list[2].decode('utf-8')
-            evalue = msg_list[3].decode('utf-8')
-            tb = msg_list[4].decode('utf-8')
-            raise RemoteRPCError(ename, evalue, tb)
+            error_dict = jsonapi.loads(msg_list[3])
+            raise RemoteRPCError(error_dict['ename'], error_dict['evalue'], error_dict['traceback'])
 
     def __getattr__(self, name):
         return RemoteMethod(self, name)
@@ -420,19 +432,22 @@ class RemoteMethod(RemoteMethodBase):
     def __call__(self, *args, **kwargs):
         return self.proxy.call(self.method, *args, **kwargs)
 
+class RPCError(Exception):
+    pass
 
-class RemoteRPCError(Exception):
+
+class RemoteRPCError(RPCError):
     """Error raised elsewhere"""
     ename = None
     evalue = None
     traceback = None
-
-    def __init__(self, ename, evalue, traceback):
+    
+    def __init__(self, ename, evalue, tb):
         self.ename = ename
         self.evalue = evalue
-        self.traceback = traceback
+        self.traceback = tb
         self.args = (ename, evalue)
-
+    
     def __repr__(self):
         return "<RemoteError:%s(%s)>" % (self.ename, self.evalue)
 
@@ -443,6 +458,5 @@ class RemoteRPCError(Exception):
         else:
             return sig
 
-
-class RPCTimeoutError(Exception):
+class RPCTimeoutError(RPCError):
     pass

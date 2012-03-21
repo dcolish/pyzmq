@@ -1,23 +1,10 @@
 """A simple RPC client that shows how to do load balancing."""
 
 #-----------------------------------------------------------------------------
+#  Copyright (C) 2012. Brian Granger, Min Ragan-Kelley  
 #
-#    Copyright (c) 2010 Min Ragan-Kelley, Brian Granger
-#
-#    This file is part of pyzmq.
-#
-#    pyzmq is free software; you can redistribute it and/or modify it under
-#    the terms of the Lesser GNU General Public License as published by
-#    the Free Software Foundation; either version 3 of the License, or
-#    (at your option) any later version.
-#
-#    pyzmq is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#    Lesser GNU General Public License for more details.
-#
-#    You should have received a copy of the Lesser GNU General Public License
-#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#  Distributed under the terms of the BSD License.  The full license is in
+#  the file COPYING.BSD, distributed as part of this software.
 #-----------------------------------------------------------------------------
 
 from zmq.rpc.simplerpc import RPCServiceProxy, RemoteRPCError, JSONSerializer
@@ -33,7 +20,9 @@ if __name__ == '__main__':
         echo.error()
     except RemoteRPCError, e:
         print "Got a remote exception:"
-        print e.ename, e.evalue, e.traceback
+        print e.ename
+        print e.evalue
+        print e.traceback
 
     math = RPCServiceProxy()
     # By connecting to two instances, requests are load balanced.
